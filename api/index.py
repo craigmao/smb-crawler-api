@@ -22,6 +22,53 @@ app.add_middleware(
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 
+# ====== 行业关键词过滤 ======
+# 酷家乐 SMB 关注的行业领域
+INDUSTRY_KEYWORDS = [
+    # 品牌 & 竞对
+    "酷家乐", "kujiale", "三维家", "打扮家", "爱福窝", "躺平设计家", "知户型",
+    "欧派", "索菲亚", "尚品宅配", "维意定制", "好莱客", "金牌厨柜", "志邦",
+    "我乐家居", "皮阿诺", "顶固", "百得胜", "诗尼曼", "冠特", "艾依格",
+    "红星美凯龙", "居然之家", "富森美", "月星家居",
+    # 行业品类
+    "全屋定制", "定制家具", "定制家居", "家装设计", "装修设计", "室内设计",
+    "装修效果图", "装修公司", "家装公司", "整装", "硬装", "软装",
+    "橱柜", "衣柜", "木门", "门窗", "地板", "瓷砖", "岩板",
+    "墙纸", "墙布", "窗帘", "涂料", "硅藻泥", "乳胶漆",
+    "灯具", "照明", "卫浴", "厨电", "暖通", "新风", "净水",
+    "家具", "沙发", "床", "餐桌", "家纺", "家饰",
+    "建材", "家居", "家装", "装修", "装饰",
+    # 技术
+    "AI设计", "AI出图", "AI渲染", "AI家装", "3D设计", "3D渲染", "BIM",
+    "VR家装", "VR样板间", "CAD", "参数化设计", "数字化",
+    "设计软件", "设计工具", "设计平台", "云设计",
+    "前后端一体", "门店管理", "量房", "效果图",
+    # 行业信号
+    "精装房", "毛坯房", "存量房", "二手房翻新", "旧房改造", "老房改造",
+    "数字化转型", "智能家居", "智能制造", "工业4.0", "柔性制造",
+    "家居展", "建博会", "家博会", "设计周",
+    # 上下游
+    "房地产", "楼市", "房价", "地产", "物业", "交房",
+    "供应链", "板材", "五金", "配件", "封边",
+    # 用户场景
+    "装修日记", "装修攻略", "装修避坑", "装修预算",
+    "小户型", "大平层", "别墅", "复式", "loft",
+    "北欧风", "现代简约", "新中式", "美式", "法式", "侘寂",
+    "厨房设计", "卫生间设计", "客厅设计", "卧室设计", "阳台设计",
+    "好好住", "住小帮", "土巴兔", "齐家网", "一兜糖",
+]
+
+INDUSTRY_KW_LOWER = [kw.lower() for kw in INDUSTRY_KEYWORDS]
+
+
+def is_relevant(text: str) -> bool:
+    """判断文本是否与家居建材行业相关"""
+    if not text:
+        return False
+    t = text.lower()
+    return any(kw in t for kw in INDUSTRY_KW_LOWER)
+
+
 # ====== 缓存 ======
 _cache: dict = {}
 CACHE_TTL = 600
@@ -214,8 +261,9 @@ async def api_36kr():
 
 
 @app.get("/api/all")
-async def api_all():
-    c = cached("all")
+async def api_all(filter: str = Query("industry", description="industry=只保留行业相关, all=全量")):
+    cache_key = f"all_{filter}"
+    c = cached(cache_key)
     if c: return c
 
     fetchers = [
@@ -232,19 +280,44 @@ async def api_all():
     results = await asyncio.gather(*[f() for _, f in fetchers], return_exceptions=True)
 
     all_items = []
-    report = {}
+    report_raw = {}
+    report_filtered = {}
+
     for i, (name, _) in enumerate(fetchers):
         r = results[i]
         if isinstance(r, Exception):
-            report[name] = f"error: {str(r)[:80]}"
-        elif isinstance(r, list):
-            all_items.extend(r)
-            report[name] = len(r)
-        else:
-            report[name] = 0
+            report_raw[name] = f"error: {str(r)[:80]}"
+            report_filtered[name] = 0
+            continue
+        if not isinstance(r, list):
+            report_raw[name] = 0
+            report_filtered[name] = 0
+            continue
 
-    result = {"code": 0, "data": all_items, "total": len(all_items), "report": report, "timestamp": datetime.now().isoformat()}
-    cache_set("all", result)
+        report_raw[name] = len(r)
+
+        if filter == "industry":
+            # 行业过滤: 保留标题/描述中包含行业关键词的条目
+            relevant = [item for item in r if is_relevant(item.get("title", "") + " " + item.get("desc", "") + " " + item.get("excerpt", "") + " " + item.get("summary", ""))]
+            # 标记相关性
+            for item in relevant:
+                item["relevant"] = True
+            all_items.extend(relevant)
+            report_filtered[name] = len(relevant)
+        else:
+            all_items.extend(r)
+            report_filtered[name] = len(r)
+
+    result = {
+        "code": 0,
+        "data": all_items,
+        "total": len(all_items),
+        "report_raw": report_raw,
+        "report_filtered": report_filtered,
+        "filter": filter,
+        "timestamp": datetime.now().isoformat(),
+    }
+    cache_set(cache_key, result)
     return result
 
 
