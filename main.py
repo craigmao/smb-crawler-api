@@ -96,7 +96,10 @@ async def search_sogou_wechat(keywords: List[str]) -> list:
                     )
                 for url, title_html in results[:10]:
                     title = re.sub(r"<[^>]+>", "", title_html).strip()
-                    title = title.replace("&ldquo;", """).replace("&rdquo;", """).replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+                    title = (title.replace("&ldquo;", "“").replace("&rdquo;", "”")
+                            .replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+                            .replace("&middot;", "·").replace("&mdash;", "—").replace("&ndash;", "–")
+                            .replace("&hellip;", "…").replace("&nbsp;", " ").replace("&lsquo;", "‘").replace("&rsquo;", "’"))
                     if title and len(title) > 3:
                         # 处理相对URL: /link?url=... -> https://weixin.sogou.com/link?url=...
                         full_url = url
