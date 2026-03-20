@@ -1,6 +1,10 @@
 """
-Vercel Serverless Function — SMB 情报爬虫 API
-自动路由: /api/* → 本文件处理
+SMB 情报爬虫 API — Vercel Python Serverless
+
+策略: 用行业关键词主动搜索各平台, 而非过滤泛热榜
+数据源:
+  搜索类: 微博搜索 / 知乎搜索 / B站搜索 / 百度搜索 / 头条搜索
+  热榜类: 保留作为"大盘感知"辅助
 """
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,139 +13,242 @@ import asyncio
 import json
 import re
 import time
+import urllib.parse
 from datetime import datetime
+from typing import List
 
 app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 
-# ====== 行业关键词过滤 ======
-# 酷家乐 SMB 关注的行业领域
-INDUSTRY_KEYWORDS = [
+# ====== 搜索关键词 (轮换使用) ======
+SEARCH_KEYWORDS = [
     # 品牌 & 竞对
-    "酷家乐", "kujiale", "三维家", "打扮家", "爱福窝", "躺平设计家", "知户型",
-    "欧派", "索菲亚", "尚品宅配", "维意定制", "好莱客", "金牌厨柜", "志邦",
-    "我乐家居", "皮阿诺", "顶固", "百得胜", "诗尼曼", "冠特", "艾依格",
-    "红星美凯龙", "居然之家", "富森美", "月星家居",
-    # 行业品类
-    "全屋定制", "定制家具", "定制家居", "家装设计", "装修设计", "室内设计",
-    "装修效果图", "装修公司", "家装公司", "整装", "硬装", "软装",
-    "橱柜", "衣柜", "木门", "门窗", "地板", "瓷砖", "岩板",
-    "墙纸", "墙布", "窗帘", "涂料", "硅藻泥", "乳胶漆",
-    "灯具", "照明", "卫浴", "厨电", "暖通", "新风", "净水",
-    "家具", "沙发", "床", "餐桌", "家纺", "家饰",
-    "建材", "家居", "家装", "装修", "装饰",
-    # 技术
-    "AI设计", "AI出图", "AI渲染", "AI家装", "3D设计", "3D渲染", "BIM",
-    "VR家装", "VR样板间", "CAD", "参数化设计", "数字化",
-    "设计软件", "设计工具", "设计平台", "云设计",
-    "前后端一体", "门店管理", "量房", "效果图",
+    "酷家乐", "三维家", "躺平设计家",
+    "欧派家居", "索菲亚家居", "尚品宅配",
+    # 核心品类
+    "全屋定制", "装修设计", "室内设计",
+    "定制家具", "智能家居",
+    # 用户需求场景
+    "装修效果图", "装修攻略",
+    "小户型装修", "厨房设计", "客厅设计",
     # 行业信号
-    "精装房", "毛坯房", "存量房", "二手房翻新", "旧房改造", "老房改造",
-    "数字化转型", "智能家居", "智能制造", "工业4.0", "柔性制造",
-    "家居展", "建博会", "家博会", "设计周",
-    # 上下游
-    "房地产", "楼市", "房价", "地产", "物业", "交房",
-    "供应链", "板材", "五金", "配件", "封边",
-    # 用户场景
-    "装修日记", "装修攻略", "装修避坑", "装修预算",
-    "小户型", "大平层", "别墅", "复式", "loft",
-    "北欧风", "现代简约", "新中式", "美式", "法式", "侘寂",
-    "厨房设计", "卫生间设计", "客厅设计", "卧室设计", "阳台设计",
-    "好好住", "住小帮", "土巴兔", "齐家网", "一兜糖",
+    "家居数字化", "AI设计 家居",
+    "家居展 2025", "建材市场",
+    "精装房 政策", "存量房 装修",
 ]
 
-INDUSTRY_KW_LOWER = [kw.lower() for kw in INDUSTRY_KEYWORDS]
-
-
-def is_relevant(text: str) -> bool:
-    """判断文本是否与家居建材行业相关"""
-    if not text:
-        return False
-    t = text.lower()
-    return any(kw in t for kw in INDUSTRY_KW_LOWER)
+# 每次采集随机取一批关键词避免重复
+def get_search_batch() -> List[str]:
+    """根据当前小时轮换关键词批次"""
+    hour = datetime.now().hour
+    batch_size = 6
+    start = (hour * batch_size) % len(SEARCH_KEYWORDS)
+    batch = SEARCH_KEYWORDS[start:start + batch_size]
+    if len(batch) < batch_size:
+        batch += SEARCH_KEYWORDS[:batch_size - len(batch)]
+    return batch
 
 
 # ====== 缓存 ======
 _cache: dict = {}
 CACHE_TTL = 600
 
-
 def cached(key):
     if key in _cache and time.time() - _cache[key]["t"] < CACHE_TTL:
         return _cache[key]["d"]
     return None
 
-
 def cache_set(key, data):
     _cache[key] = {"d": data, "t": time.time()}
 
 
-# ====== 各平台采集 ======
+# ============================================================
+# 搜索类采集器 — 用行业关键词搜索各平台
+# ============================================================
 
-async def fetch_toutiao():
+async def search_weibo(keywords: List[str]) -> list:
+    """微博综合搜索"""
+    items = []
+    async with httpx.AsyncClient(timeout=10) as c:
+        for kw in keywords:
+            try:
+                r = await c.get(
+                    f"https://m.weibo.cn/api/container/getIndex?containerid=100103type%3D1%26q%3D{urllib.parse.quote(kw)}&page_type=searchall",
+                    headers={"User-Agent": UA, "Referer": "https://m.weibo.cn/"},
+                )
+                data = r.json()
+                cards = data.get("data", {}).get("cards", [])
+                for card in cards:
+                    if card.get("card_type") == 9:
+                        mblog = card.get("mblog", {})
+                        text = re.sub(r"<[^>]+>", "", mblog.get("text", ""))
+                        items.append({
+                            "title": text[:120],
+                            "url": f"https://m.weibo.cn/detail/{mblog.get('id', '')}",
+                            "desc": f"@{mblog.get('user', {}).get('screen_name', '')}",
+                            "hot": mblog.get("reposts_count", 0) + mblog.get("comments_count", 0) + mblog.get("attitudes_count", 0),
+                            "reposts": mblog.get("reposts_count", 0),
+                            "comments": mblog.get("comments_count", 0),
+                            "likes": mblog.get("attitudes_count", 0),
+                            "source": "weibo",
+                            "keyword": kw,
+                        })
+                    elif card.get("card_type") == 11:
+                        for inner in card.get("card_group", []):
+                            if inner.get("card_type") == 9:
+                                mblog = inner.get("mblog", {})
+                                text = re.sub(r"<[^>]+>", "", mblog.get("text", ""))
+                                items.append({
+                                    "title": text[:120],
+                                    "url": f"https://m.weibo.cn/detail/{mblog.get('id', '')}",
+                                    "desc": f"@{mblog.get('user', {}).get('screen_name', '')}",
+                                    "hot": mblog.get("reposts_count", 0) + mblog.get("comments_count", 0) + mblog.get("attitudes_count", 0),
+                                    "source": "weibo",
+                                    "keyword": kw,
+                                })
+            except Exception as e:
+                print(f"[weibo search] {kw}: {e}")
+    return items
+
+
+async def search_zhihu(keywords: List[str]) -> list:
+    """知乎搜索"""
+    items = []
+    async with httpx.AsyncClient(timeout=10) as c:
+        for kw in keywords:
+            try:
+                r = await c.get(
+                    f"https://api.zhihu.com/search_v3?t=general&q={urllib.parse.quote(kw)}&correction=1&offset=0&limit=10",
+                    headers={"User-Agent": UA},
+                )
+                data = r.json()
+                for entry in data.get("data", []):
+                    obj = entry.get("object", {})
+                    title = obj.get("title") or obj.get("question", {}).get("title", "")
+                    if not title:
+                        continue
+                    title = re.sub(r"<[^>]+>", "", title)
+                    excerpt = re.sub(r"<[^>]+>", "", obj.get("excerpt", "") or obj.get("content", "") or "")
+                    url = obj.get("url", "")
+                    if "zhihu.com" not in url and obj.get("id"):
+                        qid = obj.get("question", {}).get("id", obj.get("id", ""))
+                        url = f"https://www.zhihu.com/question/{qid}"
+                    items.append({
+                        "title": title[:150],
+                        "url": url,
+                        "excerpt": excerpt[:200],
+                        "hot": obj.get("voteup_count", 0),
+                        "comments": obj.get("comment_count", 0),
+                        "source": "zhihu",
+                        "keyword": kw,
+                    })
+            except Exception as e:
+                print(f"[zhihu search] {kw}: {e}")
+    return items
+
+
+async def search_bilibili(keywords: List[str]) -> list:
+    """B站搜索"""
+    items = []
+    async with httpx.AsyncClient(timeout=10) as c:
+        for kw in keywords:
+            try:
+                r = await c.get(
+                    f"https://api.bilibili.com/x/web-interface/wbi/search/type?search_type=video&keyword={urllib.parse.quote(kw)}&page=1&page_size=10",
+                    headers={"User-Agent": UA, "Referer": "https://search.bilibili.com/"},
+                )
+                data = r.json()
+                for v in data.get("data", {}).get("result", []):
+                    title = re.sub(r"<[^>]+>", "", v.get("title", ""))
+                    items.append({
+                        "title": title[:150],
+                        "url": f"https://www.bilibili.com/video/{v.get('bvid', '')}",
+                        "desc": v.get("description", "")[:200],
+                        "owner": v.get("author", ""),
+                        "view": v.get("play", 0),
+                        "like": v.get("like", 0),
+                        "danmaku": v.get("video_review", 0),
+                        "source": "bilibili",
+                        "keyword": kw,
+                    })
+            except Exception as e:
+                print(f"[bilibili search] {kw}: {e}")
+    return items
+
+
+async def search_toutiao(keywords: List[str]) -> list:
+    """头条搜索"""
+    items = []
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+        for kw in keywords:
+            try:
+                r = await c.get(
+                    f"https://www.toutiao.com/api/search/content/?aid=24&keyword={urllib.parse.quote(kw)}&count=10&search_id=0",
+                    headers={"User-Agent": UA, "Referer": "https://www.toutiao.com/"},
+                )
+                data = r.json()
+                for item in data.get("data", []):
+                    title = item.get("title", "")
+                    if not title:
+                        continue
+                    items.append({
+                        "title": title[:150],
+                        "url": item.get("article_url", "") or item.get("display_url", "") or f"https://www.toutiao.com/article/{item.get('item_id', '')}",
+                        "desc": (item.get("abstract", "") or "")[:200],
+                        "source": "toutiao",
+                        "keyword": kw,
+                    })
+            except Exception as e:
+                print(f"[toutiao search] {kw}: {e}")
+    return items
+
+
+async def search_baidu(keywords: List[str]) -> list:
+    """百度资讯搜索"""
+    items = []
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+        for kw in keywords:
+            try:
+                r = await c.get(
+                    f"https://www.baidu.com/s?wd={urllib.parse.quote(kw)}&tn=news&rtt=4&bsst=2",
+                    headers={"User-Agent": UA},
+                )
+                html = r.text
+                # 从百度搜索结果提取标题和链接
+                results = re.findall(r'<h3[^>]*><a[^>]*href="([^"]*)"[^>]*>(.*?)</a></h3>', html)
+                for url, title_html in results[:8]:
+                    title = re.sub(r"<[^>]+>", "", title_html).strip()
+                    if title:
+                        items.append({
+                            "title": title[:150],
+                            "url": url,
+                            "source": "baidu",
+                            "keyword": kw,
+                        })
+            except Exception as e:
+                print(f"[baidu search] {kw}: {e}")
+    return items
+
+
+# ============================================================
+# 热榜类采集器 — 保留作为大盘感知
+# ============================================================
+
+async def fetch_toutiao_hot() -> list:
     async with httpx.AsyncClient(timeout=10) as c:
         r = await c.get("https://www.toutiao.com/hot-event/hot-board/?origin=toutiao_pc", headers={"User-Agent": UA})
-        items = []
-        for e in r.json().get("data", []):
-            items.append({"title": e.get("Title", ""), "url": e.get("Url", ""), "hot": e.get("HotValue", 0), "source": "toutiao"})
-        return items
+        return [{"title": e.get("Title", ""), "url": e.get("Url", ""), "hot": e.get("HotValue", 0), "source": "toutiao_hot"} for e in r.json().get("data", [])]
 
 
-async def fetch_weibo():
+async def fetch_weibo_hot() -> list:
     async with httpx.AsyncClient(timeout=10) as c:
         r = await c.get("https://weibo.com/ajax/side/hotSearch", headers={"User-Agent": UA, "Referer": "https://weibo.com/"})
-        items = []
-        for e in r.json().get("data", {}).get("realtime", []):
-            w = e.get("word", "")
-            items.append({"title": w, "url": f"https://s.weibo.com/weibo?q={w}", "hot": e.get("raw_hot", 0), "label": e.get("label_name", ""), "source": "weibo"})
-        return items
+        return [{"title": e.get("word", ""), "url": f"https://s.weibo.com/weibo?q={e.get('word', '')}", "hot": e.get("raw_hot", 0), "source": "weibo_hot"} for e in r.json().get("data", {}).get("realtime", [])]
 
 
-async def fetch_zhihu():
-    async with httpx.AsyncClient(timeout=10) as c:
-        r = await c.get("https://api.zhihu.com/topstory/hot-lists/total?limit=50", headers={"User-Agent": UA})
-        items = []
-        for e in r.json().get("data", []):
-            t = e.get("target", {})
-            items.append({"title": t.get("title", ""), "url": f"https://www.zhihu.com/question/{t.get('id', '')}", "excerpt": (t.get("excerpt", "") or "")[:200], "hot": e.get("detail_text", ""), "source": "zhihu"})
-        return items
-
-
-async def fetch_baidu():
-    async with httpx.AsyncClient(timeout=10) as c:
-        r = await c.get("https://top.baidu.com/board?tab=realtime", headers={"User-Agent": UA})
-        html = r.text
-        m = re.search(r"<!--s-data:(.*?)-->", html, re.DOTALL)
-        items = []
-        if m:
-            d = json.loads(m.group(1))
-            for card in d.get("data", {}).get("cards", []):
-                for ct in card.get("content", []):
-                    items.append({"title": ct.get("word", ""), "url": ct.get("url", ""), "desc": (ct.get("desc", "") or "")[:200], "hot": ct.get("hotScore", 0), "source": "baidu"})
-        return items
-
-
-async def fetch_bilibili():
-    async with httpx.AsyncClient(timeout=10) as c:
-        r = await c.get("https://api.bilibili.com/x/web-interface/popular?ps=50&pn=1", headers={"User-Agent": UA, "Referer": "https://www.bilibili.com/"})
-        d = r.json()
-        items = []
-        if d.get("code") == 0:
-            for v in d.get("data", {}).get("list", []):
-                s = v.get("stat", {})
-                items.append({"title": v.get("title", ""), "url": v.get("short_link_v2", "") or f"https://www.bilibili.com/video/{v.get('bvid', '')}", "owner": v.get("owner", {}).get("name", ""), "view": s.get("view", 0), "like": s.get("like", 0), "danmaku": s.get("danmaku", 0), "source": "bilibili"})
-        return items
-
-
-async def fetch_douyin():
+async def fetch_douyin_hot() -> list:
     async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
         csrf = ""
         try:
@@ -154,173 +261,123 @@ async def fetch_douyin():
         if csrf:
             h["Cookie"] = f"passport_csrf_token={csrf}"
         r = await c.get("https://www.douyin.com/aweme/v1/web/hot/search/list/?device_platform=webapp&aid=6383&channel=channel_pc_web&detail_list=1", headers=h)
-        items = []
-        for w in r.json().get("data", {}).get("word_list", []):
-            items.append({"title": w.get("word", ""), "url": f"https://www.douyin.com/search/{w.get('word', '')}", "hot": w.get("hot_value", 0), "source": "douyin"})
-        return items
+        return [{"title": w.get("word", ""), "url": f"https://www.douyin.com/search/{w.get('word', '')}", "hot": w.get("hot_value", 0), "source": "douyin_hot"} for w in r.json().get("data", {}).get("word_list", [])]
 
 
-async def fetch_sspai():
-    async with httpx.AsyncClient(timeout=10) as c:
-        r = await c.get("https://sspai.com/api/v1/article/tag/page/get?limit=20&offset=0&tag=%E7%83%AD%E9%97%A8%E6%96%87%E7%AB%A0")
-        items = []
-        for a in r.json().get("data", []):
-            items.append({"title": a.get("title", ""), "url": f"https://sspai.com/post/{a.get('id', '')}", "summary": (a.get("summary", "") or "")[:200], "likes": a.get("like_count", 0), "source": "sspai"})
-        return items
-
-
-async def fetch_36kr():
-    async with httpx.AsyncClient(timeout=10) as c:
-        r = await c.get("https://36kr.com/api/newsflash?per_page=30", headers={"User-Agent": UA})
-        items = []
-        for n in r.json().get("data", {}).get("items", []):
-            items.append({"title": n.get("title", ""), "url": n.get("news_url", f"https://36kr.com/newsflashes/{n.get('id', '')}"), "desc": (n.get("description", "") or "")[:200], "source": "36kr", "time": n.get("published_at", "")})
-        return items
-
-
-# ====== API 端点 ======
-
-@app.get("/api/toutiao")
-async def api_toutiao():
-    c = cached("toutiao")
-    if c: return c
-    items = await fetch_toutiao()
-    r = {"code": 0, "data": items, "total": len(items)}
-    cache_set("toutiao", r)
-    return r
-
-
-@app.get("/api/weibo")
-async def api_weibo():
-    c = cached("weibo")
-    if c: return c
-    items = await fetch_weibo()
-    r = {"code": 0, "data": items, "total": len(items)}
-    cache_set("weibo", r)
-    return r
-
-
-@app.get("/api/zhihu")
-async def api_zhihu():
-    c = cached("zhihu")
-    if c: return c
-    items = await fetch_zhihu()
-    r = {"code": 0, "data": items, "total": len(items)}
-    cache_set("zhihu", r)
-    return r
-
-
-@app.get("/api/baidu")
-async def api_baidu():
-    c = cached("baidu")
-    if c: return c
-    items = await fetch_baidu()
-    r = {"code": 0, "data": items, "total": len(items)}
-    cache_set("baidu", r)
-    return r
-
-
-@app.get("/api/bilibili")
-async def api_bilibili():
-    c = cached("bilibili")
-    if c: return c
-    items = await fetch_bilibili()
-    r = {"code": 0, "data": items, "total": len(items)}
-    cache_set("bilibili", r)
-    return r
-
-
-@app.get("/api/douyin")
-async def api_douyin():
-    c = cached("douyin")
-    if c: return c
-    items = await fetch_douyin()
-    r = {"code": 0, "data": items, "total": len(items)}
-    cache_set("douyin", r)
-    return r
-
-
-@app.get("/api/sspai")
-async def api_sspai():
-    c = cached("sspai")
-    if c: return c
-    items = await fetch_sspai()
-    r = {"code": 0, "data": items, "total": len(items)}
-    cache_set("sspai", r)
-    return r
-
-
-@app.get("/api/36kr")
-async def api_36kr():
-    c = cached("36kr")
-    if c: return c
-    items = await fetch_36kr()
-    r = {"code": 0, "data": items, "total": len(items)}
-    cache_set("36kr", r)
-    return r
-
+# ============================================================
+# API 端点
+# ============================================================
 
 @app.get("/api/all")
-async def api_all(filter: str = Query("industry", description="industry=只保留行业相关, all=全量")):
-    cache_key = f"all_{filter}"
-    c = cached(cache_key)
+async def api_all():
+    """核心端点: 行业搜索 + 热榜行业过滤"""
+    c = cached("all")
     if c: return c
 
-    fetchers = [
-        ("toutiao", fetch_toutiao),
-        ("weibo", fetch_weibo),
-        ("zhihu", fetch_zhihu),
-        ("baidu", fetch_baidu),
-        ("bilibili", fetch_bilibili),
-        ("douyin", fetch_douyin),
-        ("sspai", fetch_sspai),
-        ("36kr", fetch_36kr),
-    ]
+    kw_batch = get_search_batch()
 
-    results = await asyncio.gather(*[f() for _, f in fetchers], return_exceptions=True)
+    # 并行: 搜索(5平台) + 热榜(3平台)
+    results = await asyncio.gather(
+        search_weibo(kw_batch),
+        search_zhihu(kw_batch),
+        search_bilibili(kw_batch),
+        search_toutiao(kw_batch),
+        search_baidu(kw_batch),
+        fetch_toutiao_hot(),
+        fetch_weibo_hot(),
+        fetch_douyin_hot(),
+        return_exceptions=True,
+    )
+
+    names = ["weibo_search", "zhihu_search", "bilibili_search", "toutiao_search", "baidu_search", "toutiao_hot", "weibo_hot", "douyin_hot"]
 
     all_items = []
-    report_raw = {}
-    report_filtered = {}
+    report = {}
 
-    for i, (name, _) in enumerate(fetchers):
+    for i, name in enumerate(names):
         r = results[i]
         if isinstance(r, Exception):
-            report_raw[name] = f"error: {str(r)[:80]}"
-            report_filtered[name] = 0
-            continue
-        if not isinstance(r, list):
-            report_raw[name] = 0
-            report_filtered[name] = 0
-            continue
-
-        report_raw[name] = len(r)
-
-        if filter == "industry":
-            # 行业过滤: 保留标题/描述中包含行业关键词的条目
-            relevant = [item for item in r if is_relevant(item.get("title", "") + " " + item.get("desc", "") + " " + item.get("excerpt", "") + " " + item.get("summary", ""))]
-            # 标记相关性
-            for item in relevant:
-                item["relevant"] = True
-            all_items.extend(relevant)
-            report_filtered[name] = len(relevant)
-        else:
+            report[name] = f"error: {str(r)[:60]}"
+        elif isinstance(r, list):
             all_items.extend(r)
-            report_filtered[name] = len(r)
+            report[name] = len(r)
+        else:
+            report[name] = 0
+
+    # 去重 (按标题前30字符)
+    seen = set()
+    unique = []
+    for item in all_items:
+        key = item.get("title", "")[:30]
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(item)
 
     result = {
         "code": 0,
-        "data": all_items,
-        "total": len(all_items),
-        "report_raw": report_raw,
-        "report_filtered": report_filtered,
-        "filter": filter,
+        "data": unique,
+        "total": len(unique),
+        "keywords_used": kw_batch,
+        "report": report,
         "timestamp": datetime.now().isoformat(),
     }
+    cache_set("all", result)
+    return result
+
+
+@app.get("/api/search")
+async def api_search(keyword: str = Query(..., description="自定义搜索关键词")):
+    """自定义关键词搜索全平台"""
+    cache_key = f"search_{keyword}"
+    c = cached(cache_key)
+    if c: return c
+
+    kws = [keyword]
+    results = await asyncio.gather(
+        search_weibo(kws),
+        search_zhihu(kws),
+        search_bilibili(kws),
+        search_toutiao(kws),
+        search_baidu(kws),
+        return_exceptions=True,
+    )
+    names = ["weibo", "zhihu", "bilibili", "toutiao", "baidu"]
+    all_items = []
+    report = {}
+    for i, name in enumerate(names):
+        r = results[i]
+        if isinstance(r, Exception):
+            report[name] = f"error: {str(r)[:60]}"
+        elif isinstance(r, list):
+            all_items.extend(r)
+            report[name] = len(r)
+        else:
+            report[name] = 0
+
+    result = {"code": 0, "data": all_items, "total": len(all_items), "keyword": keyword, "report": report}
     cache_set(cache_key, result)
+    return result
+
+
+@app.get("/api/hot")
+async def api_hot():
+    """纯热榜 (大盘感知)"""
+    c = cached("hot")
+    if c: return c
+
+    results = await asyncio.gather(
+        fetch_toutiao_hot(), fetch_weibo_hot(), fetch_douyin_hot(),
+        return_exceptions=True,
+    )
+    items = []
+    for r in results:
+        if isinstance(r, list):
+            items.extend(r)
+    result = {"code": 0, "data": items, "total": len(items)}
+    cache_set("hot", result)
     return result
 
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "ts": datetime.now().isoformat()}
+    return {"status": "ok", "ts": datetime.now().isoformat(), "keywords": SEARCH_KEYWORDS}
