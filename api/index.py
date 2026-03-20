@@ -69,84 +69,134 @@ def cache_set(key, data):
 # ============================================================
 
 async def search_weibo(keywords: List[str]) -> list:
-    """微博综合搜索"""
+    """微博综合搜索 — 先获取访客cookie再搜索"""
     items = []
-    async with httpx.AsyncClient(timeout=10) as c:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+        # 1. 先访问 m.weibo.cn 获取 cookie
+        try:
+            await c.get("https://m.weibo.cn/", headers={"User-Agent": UA})
+        except Exception:
+            pass
+        # 2. 尝试 PC 端 ajax 搜索接口
         for kw in keywords:
             try:
                 r = await c.get(
-                    f"https://m.weibo.cn/api/container/getIndex?containerid=100103type%3D1%26q%3D{urllib.parse.quote(kw)}&page_type=searchall",
-                    headers={"User-Agent": UA, "Referer": "https://m.weibo.cn/"},
+                    f"https://weibo.com/ajax/side/hotSearch",
+                    headers={"User-Agent": UA, "Referer": "https://weibo.com/", "X-Requested-With": "XMLHttpRequest"},
                 )
-                data = r.json()
-                cards = data.get("data", {}).get("cards", [])
-                for card in cards:
-                    if card.get("card_type") == 9:
-                        mblog = card.get("mblog", {})
-                        text = re.sub(r"<[^>]+>", "", mblog.get("text", ""))
-                        items.append({
-                            "title": text[:120],
-                            "url": f"https://m.weibo.cn/detail/{mblog.get('id', '')}",
-                            "desc": f"@{mblog.get('user', {}).get('screen_name', '')}",
-                            "hot": mblog.get("reposts_count", 0) + mblog.get("comments_count", 0) + mblog.get("attitudes_count", 0),
-                            "reposts": mblog.get("reposts_count", 0),
-                            "comments": mblog.get("comments_count", 0),
-                            "likes": mblog.get("attitudes_count", 0),
-                            "source": "weibo",
-                            "keyword": kw,
-                        })
-                    elif card.get("card_type") == 11:
-                        for inner in card.get("card_group", []):
-                            if inner.get("card_type") == 9:
-                                mblog = inner.get("mblog", {})
-                                text = re.sub(r"<[^>]+>", "", mblog.get("text", ""))
-                                items.append({
-                                    "title": text[:120],
-                                    "url": f"https://m.weibo.cn/detail/{mblog.get('id', '')}",
-                                    "desc": f"@{mblog.get('user', {}).get('screen_name', '')}",
-                                    "hot": mblog.get("reposts_count", 0) + mblog.get("comments_count", 0) + mblog.get("attitudes_count", 0),
-                                    "source": "weibo",
-                                    "keyword": kw,
-                                })
+                # 如果热搜能通, 用关键词过滤
+                if r.status_code == 200:
+                    data = r.json()
+                    for entry in data.get("data", {}).get("realtime", []):
+                        word = entry.get("word", "")
+                        if kw.lower() in word.lower() or any(k in word for k in ["装修", "家居", "设计", "定制", "建材", "家具"]):
+                            items.append({
+                                "title": word,
+                                "url": f"https://s.weibo.com/weibo?q={urllib.parse.quote(word)}",
+                                "hot": entry.get("raw_hot", 0),
+                                "label": entry.get("label_name", ""),
+                                "source": "weibo",
+                                "keyword": kw,
+                            })
             except Exception as e:
                 print(f"[weibo search] {kw}: {e}")
+            # 3. 尝试 m.weibo.cn 搜索 (带cookie)
+            try:
+                r = await c.get(
+                    f"https://m.weibo.cn/api/container/getIndex?containerid=100103type%3D1%26q%3D{urllib.parse.quote(kw)}&page_type=searchall",
+                    headers={"User-Agent": UA, "Referer": "https://m.weibo.cn/", "X-Requested-With": "XMLHttpRequest"},
+                )
+                if r.status_code == 200 and "application/json" in r.headers.get("content-type", ""):
+                    data = r.json()
+                    cards = data.get("data", {}).get("cards", [])
+                    for card in cards:
+                        mblogs = []
+                        if card.get("card_type") == 9:
+                            mblogs = [card.get("mblog", {})]
+                        elif card.get("card_type") == 11:
+                            mblogs = [g.get("mblog", {}) for g in card.get("card_group", []) if g.get("card_type") == 9]
+                        for mblog in mblogs:
+                            if not mblog:
+                                continue
+                            text = re.sub(r"<[^>]+>", "", mblog.get("text", ""))
+                            items.append({
+                                "title": text[:120],
+                                "url": f"https://m.weibo.cn/detail/{mblog.get('id', '')}",
+                                "desc": f"@{mblog.get('user', {}).get('screen_name', '')}",
+                                "hot": mblog.get("reposts_count", 0) + mblog.get("comments_count", 0) + mblog.get("attitudes_count", 0),
+                                "reposts": mblog.get("reposts_count", 0),
+                                "comments": mblog.get("comments_count", 0),
+                                "likes": mblog.get("attitudes_count", 0),
+                                "source": "weibo",
+                                "keyword": kw,
+                            })
+            except Exception as e:
+                print(f"[weibo m-search] {kw}: {e}")
     return items
 
 
 async def search_zhihu(keywords: List[str]) -> list:
-    """知乎搜索"""
+    """知乎搜索 — 通过网页搜索页面解析"""
     items = []
-    async with httpx.AsyncClient(timeout=10) as c:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
         for kw in keywords:
             try:
+                # 知乎网页搜索 (不需要登录)
                 r = await c.get(
-                    f"https://api.zhihu.com/search_v3?t=general&q={urllib.parse.quote(kw)}&correction=1&offset=0&limit=10",
-                    headers={"User-Agent": UA},
+                    f"https://www.zhihu.com/search?type=content&q={urllib.parse.quote(kw)}",
+                    headers={"User-Agent": UA, "Accept": "text/html"},
                 )
-                data = r.json()
-                for entry in data.get("data", []):
-                    obj = entry.get("object", {})
-                    title = obj.get("title") or obj.get("question", {}).get("title", "")
-                    if not title:
-                        continue
-                    title = re.sub(r"<[^>]+>", "", title)
-                    excerpt = re.sub(r"<[^>]+>", "", obj.get("excerpt", "") or obj.get("content", "") or "")
-                    url = obj.get("url", "")
-                    if "zhihu.com" not in url and obj.get("id"):
-                        qid = obj.get("question", {}).get("id", obj.get("id", ""))
-                        url = f"https://www.zhihu.com/question/{qid}"
-                    items.append({
-                        "title": title[:150],
-                        "url": url,
-                        "excerpt": excerpt[:200],
-                        "hot": obj.get("voteup_count", 0),
-                        "comments": obj.get("comment_count", 0),
-                        "source": "zhihu",
-                        "keyword": kw,
-                    })
+                html = r.text
+                # 从 SSR 数据中提取搜索结果
+                match = re.search(r'<script id="js-initialData"[^>]*>(.*?)</script>', html)
+                if match:
+                    try:
+                        init_data = json.loads(match.group(1))
+                        entities = init_data.get("initialState", {}).get("entities", {})
+                        # 从 answers 和 articles 中提取
+                        for aid, answer in entities.get("answers", {}).items():
+                            question = answer.get("question", {})
+                            title = question.get("title", "") or answer.get("question", {}).get("name", "")
+                            if not title:
+                                continue
+                            items.append({
+                                "title": re.sub(r"<[^>]+>", "", title)[:150],
+                                "url": f"https://www.zhihu.com/question/{question.get('id', '')}/answer/{aid}",
+                                "excerpt": re.sub(r"<[^>]+>", "", answer.get("excerpt", ""))[:200],
+                                "hot": answer.get("voteupCount", 0),
+                                "comments": answer.get("commentCount", 0),
+                                "source": "zhihu",
+                                "keyword": kw,
+                            })
+                        for aid, article in entities.get("articles", {}).items():
+                            title = article.get("title", "")
+                            if not title:
+                                continue
+                            items.append({
+                                "title": re.sub(r"<[^>]+>", "", title)[:150],
+                                "url": f"https://zhuanlan.zhihu.com/p/{aid}",
+                                "excerpt": re.sub(r"<[^>]+>", "", article.get("excerpt", ""))[:200],
+                                "hot": article.get("voteupCount", 0),
+                                "source": "zhihu",
+                                "keyword": kw,
+                            })
+                    except (json.JSONDecodeError, KeyError) as e:
+                        print(f"[zhihu parse] {kw}: {e}")
+                # 备用: 从 HTML title 标签提取搜索建议
+                if not items:
+                    titles = re.findall(r'<h2[^>]*class="[^"]*ContentItem-title[^"]*"[^>]*>.*?<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>', html, re.DOTALL)
+                    for url, title_html in titles[:10]:
+                        title = re.sub(r"<[^>]+>", "", title_html).strip()
+                        if title:
+                            full_url = url if url.startswith("http") else f"https://www.zhihu.com{url}"
+                            items.append({
+                                "title": title[:150],
+                                "url": full_url,
+                                "source": "zhihu",
+                                "keyword": kw,
+                            })
             except Exception as e:
                 print(f"[zhihu search] {kw}: {e}")
-    return items
 
 
 async def search_bilibili(keywords: List[str]) -> list:
@@ -179,54 +229,111 @@ async def search_bilibili(keywords: List[str]) -> list:
 
 
 async def search_toutiao(keywords: List[str]) -> list:
-    """头条搜索"""
+    """头条搜索 — 用 so.toutiao.com 搜索页解析"""
     items = []
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+        # 先访问头条首页获取cookie
+        try:
+            await c.get("https://www.toutiao.com/", headers={"User-Agent": UA})
+        except Exception:
+            pass
         for kw in keywords:
             try:
+                # 用头条搜索页
                 r = await c.get(
-                    f"https://www.toutiao.com/api/search/content/?aid=24&keyword={urllib.parse.quote(kw)}&count=10&search_id=0",
+                    f"https://so.toutiao.com/search?keyword={urllib.parse.quote(kw)}&pd=information&source=search_subtab_switch&dvpf=pc&aid=24&page_num=0",
                     headers={"User-Agent": UA, "Referer": "https://www.toutiao.com/"},
                 )
-                data = r.json()
-                for item in data.get("data", []):
-                    title = item.get("title", "")
-                    if not title:
-                        continue
-                    items.append({
-                        "title": title[:150],
-                        "url": item.get("article_url", "") or item.get("display_url", "") or f"https://www.toutiao.com/article/{item.get('item_id', '')}",
-                        "desc": (item.get("abstract", "") or "")[:200],
-                        "source": "toutiao",
-                        "keyword": kw,
-                    })
+                html = r.text
+                # 从搜索结果页提取
+                # 尝试提取 SSR 数据
+                match = re.search(r'rawData\s*=\s*(\{.*?\})\s*;?\s*</script>', html, re.DOTALL)
+                if match:
+                    try:
+                        raw = json.loads(match.group(1))
+                        for item in raw.get("data", []):
+                            title = item.get("title", "")
+                            if not title:
+                                continue
+                            items.append({
+                                "title": re.sub(r"<[^>]+>", "", title)[:150],
+                                "url": item.get("url", "") or item.get("article_url", ""),
+                                "desc": (item.get("abstract", "") or "")[:200],
+                                "source": "toutiao",
+                                "keyword": kw,
+                            })
+                    except json.JSONDecodeError:
+                        pass
+                # 备用: 从HTML提取链接
+                if not any(i.get("keyword") == kw for i in items):
+                    links = re.findall(r'<a[^>]*href="(https?://www\.toutiao\.com/article/[^"]*)"[^>]*>(.*?)</a>', html)
+                    for url, title_html in links[:8]:
+                        title = re.sub(r"<[^>]+>", "", title_html).strip()
+                        if title and len(title) > 5:
+                            items.append({
+                                "title": title[:150],
+                                "url": url,
+                                "source": "toutiao",
+                                "keyword": kw,
+                            })
             except Exception as e:
                 print(f"[toutiao search] {kw}: {e}")
     return items
 
 
 async def search_baidu(keywords: List[str]) -> list:
-    """百度资讯搜索"""
+    """百度资讯搜索 — 用百度资讯 feed API"""
     items = []
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
         for kw in keywords:
             try:
+                # 方案1: 百度资讯搜索 API (JSON)
                 r = await c.get(
-                    f"https://www.baidu.com/s?wd={urllib.parse.quote(kw)}&tn=news&rtt=4&bsst=2",
-                    headers={"User-Agent": UA},
+                    f"https://www.baidu.com/sf/vsearch?wd={urllib.parse.quote(kw)}&pd=news&tn=news&tpl=news",
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+                        "Accept": "text/html",
+                    },
                 )
                 html = r.text
-                # 从百度搜索结果提取标题和链接
-                results = re.findall(r'<h3[^>]*><a[^>]*href="([^"]*)"[^>]*>(.*?)</a></h3>', html)
+                # 从移动端资讯页提取
+                results = re.findall(r'<a[^>]*href="([^"]*)"[^>]*class="[^"]*title[^"]*"[^>]*>(.*?)</a>', html, re.DOTALL)
+                if not results:
+                    # 备用正则
+                    results = re.findall(r'<h3[^>]*>.*?<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>.*?</h3>', html, re.DOTALL)
+                if not results:
+                    # 再试一种
+                    results = re.findall(r'"title":"(.*?)".*?"url":"(.*?)"', html)
+                    results = [(url, title) for title, url in results]
                 for url, title_html in results[:8]:
                     title = re.sub(r"<[^>]+>", "", title_html).strip()
-                    if title:
+                    if title and len(title) > 3:
                         items.append({
                             "title": title[:150],
                             "url": url,
                             "source": "baidu",
                             "keyword": kw,
                         })
+                # 方案2: 如果上面没结果, 用百度搜索 (手机UA绕过安全验证)
+                if not any(i.get("keyword") == kw for i in items):
+                    r2 = await c.get(
+                        f"https://m.baidu.com/s?word={urllib.parse.quote(kw)}&sa=re_dqa_zy&pn=0&rn=10",
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
+                            "Accept": "text/html",
+                        },
+                    )
+                    html2 = r2.text
+                    results2 = re.findall(r'"title":"(.*?)"', html2)
+                    for title in results2[:8]:
+                        title = re.sub(r"<[^>]+>", "", title).strip()
+                        if title and len(title) > 5:
+                            items.append({
+                                "title": title[:150],
+                                "url": f"https://m.baidu.com/s?word={urllib.parse.quote(kw)}",
+                                "source": "baidu",
+                                "keyword": kw,
+                            })
             except Exception as e:
                 print(f"[baidu search] {kw}: {e}")
     return items
