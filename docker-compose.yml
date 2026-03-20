@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  # ====== 核心爬虫 API ======
+  crawler-api:
+    build: .
+    ports:
+      - "8000:8000"
+    restart: always
+    environment:
+      - TZ=Asia/Shanghai
+
+  # ====== MediaCrawler (小红书/抖音/B站深度采集) ======
+  # 取消注释后启用，需要先 git clone MediaCrawler
+  # media-crawler:
+  #   build:
+  #     context: ./MediaCrawler
+  #     dockerfile: Dockerfile
+  #   ports:
+  #     - "8080:8080"
+  #   volumes:
+  #     - ./data/media-crawler:/app/data
+  #   environment:
+  #     - PLATFORM=xhs  # xhs / douyin / bilibili / weibo / zhihu
+  #     - LOGIN_TYPE=qrcode
+  #   restart: always
